@@ -223,7 +223,10 @@ class _MCPMiddleware:
         body = await self._read_body(receive)
         tool_name = self._extract_tool_name(body)
 
-        # Replay the buffered body as a single chunk.
+        # Replay the buffered body as a single chunk, then forward any real
+        # client disconnects from the original receive callable. Returning
+        # a synthetic http.disconnect here would prematurely abort SSE
+        # streaming responses (fastmcp Streamable HTTP) before they finish.
         replayed = False
 
         async def replay_receive():
@@ -231,7 +234,7 @@ class _MCPMiddleware:
             if not replayed:
                 replayed = True
                 return {"type": "http.request", "body": body, "more_body": False}
-            return {"type": "http.disconnect"}
+            return await receive()
 
         start = time.monotonic()
         await self._app(scope, replay_receive, send)
