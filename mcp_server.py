@@ -18,6 +18,7 @@ import collections
 import json
 import logging
 import os
+import pathlib
 import sys
 import time
 from datetime import datetime, timezone
@@ -56,7 +57,7 @@ engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_size=4, max_overfl
 
 # Cap every query at 10 s — reduced from 30 s. Enough for all named tools
 # (get_consensus_buys CTE runs ~1-3 s on this dataset) while cutting off
-# pathological queries 3× faster than before.
+# pathological cartesian joins in query_sql 3× faster than before.
 @event.listens_for(engine, "connect")
 def _set_statement_timeout(dbapi_conn, _record):
     cur = dbapi_conn.cursor()
@@ -81,20 +82,22 @@ mcp = FastMCP("stock-research", auth=auth)
 
 
 # ── Rate limiter + tool call logger (ASGI middleware) ────────────────
-_RATE_WINDOW = 60    # seconds per sliding window
-_RATE_LIMIT = 20     # max tool calls per window per user
-_MAX_BODY = 64_000   # bytes — safeguard against oversized POST bodies
+_RATE_WINDOW  = 60      # seconds per sliding window
+_RATE_LIMIT   = 20      # max calls per window per user
+_DAILY_LIMIT  = 100     # max calls per user per UTC day
+_MAX_BODY     = 64_000  # bytes — safeguard against oversized POST bodies
+_USAGE_PATH   = pathlib.Path(
+    os.environ.get("MCP_USAGE_FILE", "./mcp_usage.json")
+)
 
 
 class _MCPMiddleware:
-    """ASGI middleware: per-user sliding window rate limit + tool call logging.
+    """ASGI middleware: sliding window rate limit + daily quota + call logging.
 
-    Rate limit: 20 calls / 60 s per GitHub user, keyed on the JWT payload
-    "login" (GitHub username) or "sub" (GitHub user ID) claim. State is
-    in-process — resets on container restart.
-
-    Logging: one JSON line per tool call on mcp.calls logger, fields:
-    ts (ISO8601 UTC), user, tool, ms.
+    Rate limit:  20 calls / 60 s per GitHub user (in-process sliding window).
+    Daily quota: 100 calls / UTC day per user, persisted to MCP_USAGE_FILE so
+                 it survives container restarts.
+    Logging: one JSON line per tool call on mcp.calls logger.
     """
 
     def __init__(self, app) -> None:
@@ -102,6 +105,10 @@ class _MCPMiddleware:
         self._windows: collections.defaultdict[str, collections.deque] = (
             collections.defaultdict(collections.deque)
         )
+        # Daily quota — loaded from persistent file, reset at UTC midnight.
+        self._usage_date: str = ""
+        self._usage: dict[str, int] = {}
+        self._load_usage()
 
     async def __call__(self, scope, receive, send) -> None:
         # Only intercept HTTP POST requests (tool calls + some OAuth flows).
@@ -112,11 +119,15 @@ class _MCPMiddleware:
 
         user = self._user_from_scope(scope)
 
-        # Rate-limit only the MCP tool call endpoint.
+        # Rate-limit + daily quota — only on the MCP tool call endpoint.
         if scope.get("path") == "/mcp":
             allowed, retry_after = self._check_rate(user)
             if not allowed:
                 await self._send_429(send, retry_after)
+                return
+            quota_ok, remaining = self._check_daily_quota(user)
+            if not quota_ok:
+                await self._send_429_daily(send, user)
                 return
 
         # Buffer the request body so we can (a) peek at the tool name for
@@ -139,11 +150,13 @@ class _MCPMiddleware:
         ms = int((time.monotonic() - start) * 1000)
 
         if tool_name:
+            self._increment_usage(user)
             call_log.info(json.dumps({
                 "ts": datetime.now(timezone.utc).isoformat(),
                 "user": user,
                 "tool": tool_name,
                 "ms": ms,
+                "daily_remaining": _DAILY_LIMIT - self._usage.get(user, 0),
             }))
 
     # ── helpers ────────────────────────────────────────────────────
@@ -209,6 +222,47 @@ class _MCPMiddleware:
         dq.append(now)
         return True, 0
 
+    def _check_daily_quota(self, user: str) -> tuple[bool, int]:
+        """Daily quota check. Returns (allowed, remaining_calls)."""
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if today != self._usage_date:
+            self._usage_date = today
+            self._usage = {}
+        count = self._usage.get(user, 0)
+        if count >= _DAILY_LIMIT:
+            return False, 0
+        return True, _DAILY_LIMIT - count
+
+    def _increment_usage(self, user: str) -> None:
+        self._usage[user] = self._usage.get(user, 0) + 1
+        self._save_usage()
+
+    def _load_usage(self) -> None:
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        try:
+            if _USAGE_PATH.exists():
+                data = json.loads(_USAGE_PATH.read_text())
+                if data.get("date") == today:
+                    self._usage_date = today
+                    self._usage = data.get("usage", {})
+                    return
+        except Exception:
+            pass
+        self._usage_date = today
+        self._usage = {}
+
+    def _save_usage(self) -> None:
+        try:
+            _USAGE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            tmp = _USAGE_PATH.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(
+                {"date": self._usage_date, "usage": self._usage},
+                ensure_ascii=False,
+            ))
+            tmp.replace(_USAGE_PATH)
+        except Exception as e:
+            logging.getLogger("mcp.usage").warning("usage save failed: %s", e)
+
     @staticmethod
     async def _send_429(send, retry_after: int) -> None:
         body = json.dumps(
@@ -221,6 +275,19 @@ class _MCPMiddleware:
                 [b"content-type", b"application/json"],
                 [b"retry-after", str(retry_after).encode()],
             ],
+        })
+        await send({"type": "http.response.body", "body": body, "more_body": False})
+
+    @staticmethod
+    async def _send_429_daily(send, user: str) -> None:
+        body = json.dumps({
+            "error": "daily_quota_exceeded",
+            "message": f"Daily limit of {_DAILY_LIMIT} calls reached. Resets at UTC midnight.",
+        }).encode()
+        await send({
+            "type": "http.response.start",
+            "status": 429,
+            "headers": [[b"content-type", b"application/json"]],
         })
         await send({"type": "http.response.body", "body": body, "more_body": False})
 
@@ -301,7 +368,7 @@ def get_stock_pnl(etf: str, stock_code: str) -> dict:
 
     NOTE: this is current valuation, NOT realized P&L. Real cost-basis
     P&L needs the cumulative buy series — use get_stock_history then
-    compute outside, or use get_stock_history.
+    compute outside, or run query_sql with a CTE.
     """
     with engine.connect() as conn:
         return mcp_tools.get_stock_pnl(conn, etf, stock_code)
@@ -333,6 +400,32 @@ def get_consensus_buys(
         )
 
 
+@mcp.tool()
+def query_sql(sql: str) -> dict:
+    """Run an arbitrary SELECT against the read-only PG warehouse.
+
+    Escape hatch for queries the 5 named recipes don't cover.
+
+    Four safety layers:
+    1. PG user is `claude_mcp_ro` (only SELECT granted at DB level).
+    2. SQL length capped at 5000 characters.
+    3. Server rejects regex match of write keywords before sending.
+    4. Result truncated to first 1000 rows; truncation flag returned.
+
+    Args:
+        sql: a SELECT statement. Write keywords (INSERT/UPDATE/DELETE/
+            DROP/TRUNCATE/ALTER/CREATE/GRANT/REVOKE/COPY/VACUUM) are
+            rejected before execution.
+
+    Returns:
+        {"rows": [...], "truncated": bool, "row_count": int}
+        On error: {"error": "<message>", "rows": [], "truncated": false}
+
+    Tip: the 8-table schema is documented in tw-active's
+    `.claude/skills/stock_analyst/SKILL.md`.
+    """
+    with engine.connect() as conn:
+        return mcp_tools.query_sql(conn, sql)
 
 
 # ── Entry ───────────────────────────────────────────────────────────
