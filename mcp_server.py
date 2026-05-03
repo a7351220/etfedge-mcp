@@ -27,6 +27,7 @@ import uvicorn
 from fastmcp import FastMCP
 from fastmcp.server.auth.providers.github import GitHubProvider
 from sqlalchemy import create_engine, event
+from starlette.middleware.cors import CORSMiddleware
 
 # Path tweak so `import mcp_tools` works whether started from /app or /app/scripts.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -600,6 +601,17 @@ def main() -> int:
     # all live under /mcp/* via the same mount, served by GitHubProvider.
     app = mcp.http_app(path="/mcp", transport="http")
     app = _MCPMiddleware(app)
+    # CORS: claude.ai loads MCP from a browser context so preflight OPTIONS
+    # must be answered with permissive headers, otherwise the browser blocks
+    # the actual POST and the connector page shows an opaque "auth failed".
+    app = CORSMiddleware(
+        app,
+        allow_origins=["https://claude.ai", "https://*.claude.ai"],
+        allow_methods=["GET", "POST", "OPTIONS", "DELETE"],
+        allow_headers=["*"],
+        allow_credentials=True,
+        expose_headers=["mcp-session-id", "mcp-protocol-version"],
+    )
     uvicorn.run(app, host=HOST, port=PORT, log_level="info")
     return 0
 
