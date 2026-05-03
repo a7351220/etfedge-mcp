@@ -91,6 +91,82 @@ _USAGE_PATH   = pathlib.Path(
 )
 _ADMIN_TOKEN  = os.environ.get("ADMIN_TOKEN", "")
 
+_DASHBOARD_HTML = """<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<title>etfedge MCP · usage</title>
+<style>
+:root { --paper:#fafaf7; --panel:#fff; --ink:#1a1a1a; --soft:#888; --rule:#dddad2; --up:#b8860b; --down:#b04040; }
+* { box-sizing:border-box; margin:0; padding:0; }
+body { font-family: ui-monospace,Menlo,monospace; background:var(--paper); color:var(--ink); padding:24px; max-width:760px; margin:0 auto; }
+h1 { font-size:14px; letter-spacing:0.1em; margin-bottom:12px; }
+.bar { background:var(--ink); color:#fff; padding:10px 16px; margin:-24px -24px 16px; display:flex; justify-content:space-between; align-items:center; }
+.bar .name { font-size:13px; font-weight:700; letter-spacing:0.08em; }
+.bar .stat { font-size:10px; color:rgba(255,255,255,0.4); }
+.bar .stat strong { color:var(--up); }
+.cards { display:grid; grid-template-columns:repeat(3,1fr); gap:8px; margin-bottom:18px; }
+.card { background:var(--panel); border:1px solid var(--rule); border-top:2px solid var(--ink); padding:12px 14px; }
+.card .lbl { font-size:9px; letter-spacing:0.12em; text-transform:uppercase; color:var(--soft); }
+.card .val { font-size:24px; font-weight:700; color:var(--up); margin-top:4px; }
+table { width:100%; border-collapse:collapse; background:var(--panel); border:1px solid var(--rule); }
+th { text-align:left; font-size:10px; letter-spacing:0.08em; text-transform:uppercase; color:var(--soft); padding:8px 12px; border-bottom:1px solid var(--rule); font-weight:500; }
+td { padding:9px 12px; border-bottom:1px solid var(--rule); font-size:12px; }
+tr:last-child td { border-bottom:none; }
+td.code { font-weight:600; }
+td.right { text-align:right; }
+.fill { display:inline-block; height:6px; background:var(--rule); width:80px; vertical-align:middle; margin-right:6px; }
+.fill > span { display:block; height:100%; background:var(--up); }
+.warn { color:var(--down); font-weight:600; }
+.empty { padding:30px; text-align:center; color:var(--soft); }
+.foot { margin-top:18px; font-size:10px; color:var(--soft); display:flex; justify-content:space-between; }
+</style>
+</head>
+<body>
+<div class="bar">
+  <span class="name">ETFEDGE.MCP</span>
+  <span class="stat" id="stat">— · — calls today</span>
+</div>
+<div class="cards" id="cards"></div>
+<div id="table-wrap"></div>
+<div class="foot"><span id="updated">—</span><span><a href="javascript:load()" style="color:inherit">↻ refresh</a></span></div>
+<script>
+const TOKEN = "__TOKEN__";
+async function load() {
+  const r = await fetch("/admin/usage", { headers: { Authorization: "Bearer " + TOKEN } });
+  if (!r.ok) { document.body.innerHTML = "fetch failed: " + r.status; return; }
+  const d = await r.json();
+  document.getElementById("stat").innerHTML = `<strong>${d.total_users}</strong> users · <strong>${d.total_calls_today}</strong> calls · ${d.date}`;
+  document.getElementById("cards").innerHTML = `
+    <div class="card"><div class="lbl">Date (UTC)</div><div class="val" style="font-size:18px">${d.date}</div></div>
+    <div class="card"><div class="lbl">Active users</div><div class="val">${d.total_users}</div></div>
+    <div class="card"><div class="lbl">Total calls</div><div class="val">${d.total_calls_today}</div></div>`;
+  const wrap = document.getElementById("table-wrap");
+  const users = d.users || {};
+  const keys = Object.keys(users);
+  if (!keys.length) {
+    wrap.innerHTML = '<div class="empty">no calls today</div>';
+  } else {
+    const rows = keys.map(u => {
+      const x = users[u];
+      const pct = Math.round(x.used / x.limit * 100);
+      const cls = x.remaining < 10 ? "warn" : "";
+      return `<tr>
+        <td class="code">${u}</td>
+        <td class="right">${x.used}</td>
+        <td class="right"><span class="fill"><span style="width:${pct}%"></span></span><span class="${cls}">${x.remaining} left</span></td>
+      </tr>`;
+    }).join("");
+    wrap.innerHTML = `<table><thead><tr><th>github user</th><th class="right">used</th><th class="right">remaining (limit ${d.limit_per_user})</th></tr></thead><tbody>${rows}</tbody></table>`;
+  }
+  document.getElementById("updated").textContent = "updated " + new Date().toLocaleTimeString();
+}
+load();
+setInterval(load, 30000);
+</script>
+</body>
+</html>"""
+
 
 class _MCPMiddleware:
     """ASGI middleware: sliding window rate limit + daily quota + call logging.
@@ -112,12 +188,15 @@ class _MCPMiddleware:
         self._load_usage()
 
     async def __call__(self, scope, receive, send) -> None:
-        # Admin observability endpoint (GET only).
-        if (scope["type"] == "http"
-                and scope.get("method") == "GET"
-                and scope.get("path") == "/admin/usage"):
-            await self._handle_admin_usage(scope, send)
-            return
+        # Admin observability endpoints (GET only).
+        if scope["type"] == "http" and scope.get("method") == "GET":
+            path = scope.get("path")
+            if path == "/admin/usage":
+                await self._handle_admin_usage(scope, send)
+                return
+            if path == "/admin/dashboard":
+                await self._handle_admin_dashboard(scope, send)
+                return
 
         # Only intercept HTTP POST requests (tool calls + some OAuth flows).
         # All other traffic (GET for OAuth, WebSocket, lifespan) passes through.
@@ -344,6 +423,27 @@ class _MCPMiddleware:
             "headers": [[b"content-type", b"application/json"]],
         })
         await send({"type": "http.response.body", "body": body, "more_body": False})
+
+    async def _handle_admin_dashboard(self, scope, send) -> None:
+        """GET /admin/dashboard?token=XXX — HTML page that polls /admin/usage."""
+        if not _ADMIN_TOKEN:
+            await self._send_admin_err(send, 503, "ADMIN_TOKEN not configured")
+            return
+
+        # Token from query string ?token=XXX
+        qs = scope.get("query_string", b"").decode("latin-1", errors="replace")
+        params = dict(p.split("=", 1) for p in qs.split("&") if "=" in p)
+        if params.get("token") != _ADMIN_TOKEN:
+            await self._send_admin_err(send, 401, "invalid admin token")
+            return
+
+        html = _DASHBOARD_HTML.replace("__TOKEN__", _ADMIN_TOKEN).encode()
+        await send({
+            "type": "http.response.start",
+            "status": 200,
+            "headers": [[b"content-type", b"text/html; charset=utf-8"]],
+        })
+        await send({"type": "http.response.body", "body": html, "more_body": False})
 
     @staticmethod
     async def _send_admin_err(send, status: int, msg: str) -> None:
