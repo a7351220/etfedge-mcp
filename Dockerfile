@@ -11,7 +11,9 @@ WORKDIR /app
 COPY pyproject.toml ./
 COPY mcp_server.py mcp_tools.py ./
 
-RUN pip install --no-cache-dir -e .
+# Install runtime deps directly (avoid editable install — flat layout has no package).
+RUN pip install --no-cache-dir \
+    "fastmcp>=2.0" "uvicorn[standard]>=0.30" "sqlalchemy>=2.0" "psycopg[binary]>=3.2"
 
 ENV MCP_USAGE_FILE=/app/state/mcp_usage.json
 RUN mkdir -p /app/state
