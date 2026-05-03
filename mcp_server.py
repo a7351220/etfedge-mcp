@@ -89,6 +89,7 @@ _MAX_BODY     = 64_000  # bytes — safeguard against oversized POST bodies
 _USAGE_PATH   = pathlib.Path(
     os.environ.get("MCP_USAGE_FILE", "./mcp_usage.json")
 )
+_ADMIN_TOKEN  = os.environ.get("ADMIN_TOKEN", "")
 
 
 class _MCPMiddleware:
@@ -111,6 +112,13 @@ class _MCPMiddleware:
         self._load_usage()
 
     async def __call__(self, scope, receive, send) -> None:
+        # Admin observability endpoint (GET only).
+        if (scope["type"] == "http"
+                and scope.get("method") == "GET"
+                and scope.get("path") == "/admin/usage"):
+            await self._handle_admin_usage(scope, send)
+            return
+
         # Only intercept HTTP POST requests (tool calls + some OAuth flows).
         # All other traffic (GET for OAuth, WebSocket, lifespan) passes through.
         if scope["type"] != "http" or scope.get("method") != "POST":
@@ -287,6 +295,62 @@ class _MCPMiddleware:
         await send({
             "type": "http.response.start",
             "status": 429,
+            "headers": [[b"content-type", b"application/json"]],
+        })
+        await send({"type": "http.response.body", "body": body, "more_body": False})
+
+    async def _handle_admin_usage(self, scope, send) -> None:
+        """GET /admin/usage — JSON dump of today's per-user quota state.
+
+        Auth: Bearer token in Authorization header must equal ADMIN_TOKEN env var.
+        Returns 503 if ADMIN_TOKEN not configured (defense in depth).
+        """
+        if not _ADMIN_TOKEN:
+            await self._send_admin_err(send, 503, "ADMIN_TOKEN not configured")
+            return
+
+        # Read Authorization header (case-insensitive in HTTP, but ASGI lowercases keys).
+        headers = dict(scope.get("headers") or [])
+        auth = headers.get(b"authorization", b"").decode("latin-1", errors="replace")
+        if auth != f"Bearer {_ADMIN_TOKEN}":
+            await self._send_admin_err(send, 401, "invalid admin token")
+            return
+
+        # Refresh date in case caller crosses UTC midnight.
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if today != self._usage_date:
+            self._usage_date = today
+            self._usage = {}
+
+        users = {
+            u: {
+                "used": n,
+                "limit": _DAILY_LIMIT,
+                "remaining": max(0, _DAILY_LIMIT - n),
+            }
+            for u, n in sorted(self._usage.items(), key=lambda kv: -kv[1])
+        }
+        body = json.dumps({
+            "date": self._usage_date,
+            "limit_per_user": _DAILY_LIMIT,
+            "rate_limit_per_min": _RATE_LIMIT,
+            "total_users": len(users),
+            "total_calls_today": sum(self._usage.values()),
+            "users": users,
+        }, indent=2).encode()
+        await send({
+            "type": "http.response.start",
+            "status": 200,
+            "headers": [[b"content-type", b"application/json"]],
+        })
+        await send({"type": "http.response.body", "body": body, "more_body": False})
+
+    @staticmethod
+    async def _send_admin_err(send, status: int, msg: str) -> None:
+        body = json.dumps({"error": msg}).encode()
+        await send({
+            "type": "http.response.start",
+            "status": status,
             "headers": [[b"content-type", b"application/json"]],
         })
         await send({"type": "http.response.body", "body": body, "more_body": False})
