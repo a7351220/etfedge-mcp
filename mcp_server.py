@@ -479,7 +479,7 @@ def list_etfs() -> list[dict]:
 @mcp.tool()
 def get_etf_buy_delta(
     etf: str, start_date: str, end_date: str
-) -> list[dict]:
+) -> dict:
     """ETF holdings change between two dates: which stocks were bought / sold.
 
     Args:
@@ -488,17 +488,57 @@ def get_etf_buy_delta(
             backward to the most recent trading day on or before this date.
         end_date: YYYY-MM-DD (inclusive). Same snap-back rule.
 
-    Returns up to 50 rows ordered by absolute delta_value_yi desc:
-        [{"stock_code": "2330", "stock_name": "台積電",
-          "delta_shares": 1234567, "delta_value_yi": 42.9}, ...]
-        delta_shares: + = bought, - = sold (in shares, not lots).
-        delta_value_yi: estimated NTD value at end_date close, in 億.
+    Returns:
+        {
+          "etf": {"code": "00981A", "name": "<official name from meta>"},
+          "deltas": [
+            {"stock_code": "2330", "stock_name": "台積電",
+             "delta_shares": 1234567, "delta_value_yi": 42.9,
+             "as_of": "2026-04-30"},
+            ...
+          ]
+        }
+    Up to 50 rows ordered by abs(delta_value_yi) desc.
+    delta_shares: + = bought, - = sold (in shares, not lots).
+    delta_value_yi: estimated NTD value at end_date close, in 億.
 
-    Cash markers (C_NTD/M_NTD/PFUR_NTD/RDI_NTD/DA_*) and futures
-    (^[0-9]{6}F) are excluded from results.
+    IMPORTANT: Use the `etf.name` field for the ETF's official name.
+    Do not infer the name from training data — names get rebranded.
+
+    Cash markers and futures are excluded.
     """
     with engine.connect() as conn:
         return mcp_tools.get_etf_buy_delta(conn, etf, start_date, end_date)
+
+
+@mcp.tool()
+def get_etf_holdings(etf: str) -> dict:
+    """Latest current holdings snapshot for one ETF (all stocks, not deltas).
+
+    Use this when the question is "what does ETF X currently hold" rather
+    than "what changed between two dates" (which is get_etf_buy_delta).
+
+    Args:
+        etf: ETF code, e.g. "00981A".
+
+    Returns:
+        {
+          "etf": {"code": "00981A", "name": "<official name>"},
+          "n_holdings": 47,
+          "as_of": "2026-04-30",
+          "holdings": [
+            {"stock_code": "2330", "stock_name": "台積電",
+             "shares": 12345678, "close": 850.0, "value_yi": 105.0,
+             "weight_pct": 28.5, "as_of": "2026-04-30"},
+            ...   # ordered by value desc; entire portfolio (not just top N)
+          ]
+        }
+    weight_pct sums to ~100%. Cash markers / futures excluded.
+
+    IMPORTANT: Use `etf.name` from response. Don't guess names.
+    """
+    with engine.connect() as conn:
+        return mcp_tools.get_etf_holdings(conn, etf)
 
 
 @mcp.tool()

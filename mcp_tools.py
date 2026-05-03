@@ -60,9 +60,24 @@ def list_etfs(conn: Connection) -> list[dict]:
     return [_row_to_dict(r) for r in conn.execute(sql)]
 
 
+def _etf_label(conn: Connection, etf: str) -> dict:
+    """Resolve ETF code → {code, name} from latest meta snapshot."""
+    sql = text(
+        """
+        SELECT m.stock_name AS name
+        FROM meta m
+        WHERE m.etf_code = :etf
+        ORDER BY m.snapshot_year DESC
+        LIMIT 1
+        """
+    )
+    row = conn.execute(sql, {"etf": etf}).first()
+    return {"code": etf, "name": row[0] if row else None}
+
+
 def get_etf_buy_delta(
     conn: Connection, etf: str, start_date: str, end_date: str
-) -> list[dict]:
+) -> dict:
     sql = text(
         f"""
         WITH start_snap AS (
@@ -75,7 +90,7 @@ def get_etf_buy_delta(
             )
         ),
         end_snap AS (
-          SELECT stock_code, stock_name, share_count
+          SELECT stock_code, stock_name, share_count, trade_date
           FROM shares
           WHERE etf_code = :etf
             AND trade_date = (
@@ -97,7 +112,8 @@ def get_etf_buy_delta(
           round(
             (e.share_count - coalesce(s.share_count, 0)) * c.close / 1e8,
             2
-          ) AS delta_value_yi
+          ) AS delta_value_yi,
+          e.trade_date AS as_of
         FROM end_snap e
         LEFT JOIN start_snap s USING (stock_code)
         LEFT JOIN end_close c USING (stock_code)
@@ -109,12 +125,56 @@ def get_etf_buy_delta(
         LIMIT 50
         """
     )
-    return [
+    rows = [
         _row_to_dict(r)
         for r in conn.execute(
             sql, {"etf": etf, "start_date": start_date, "end_date": end_date}
         )
     ]
+    return {"etf": _etf_label(conn, etf), "deltas": rows}
+
+
+def get_etf_holdings(conn: Connection, etf: str) -> dict:
+    """Latest holdings snapshot for one ETF (all stocks, with weight + value)."""
+    sql = text(
+        f"""
+        WITH latest AS (
+          SELECT max(trade_date) AS d FROM shares WHERE etf_code = :etf
+        ),
+        snap AS (
+          SELECT s.stock_code, s.stock_name, s.share_count, s.trade_date,
+                 p.close
+          FROM shares s
+          LEFT JOIN prices p USING (stock_code, trade_date)
+          WHERE s.etf_code = :etf
+            AND s.trade_date = (SELECT d FROM latest)
+            AND {_EXCLUDE_NON_STOCK.replace('stock_code', 's.stock_code')}
+        ),
+        total AS (
+          SELECT sum(share_count * close) AS total_value FROM snap
+          WHERE close IS NOT NULL
+        )
+        SELECT
+          s.stock_code,
+          s.stock_name,
+          s.share_count::bigint AS shares,
+          s.close,
+          round((s.share_count * s.close / 1e8)::numeric, 4) AS value_yi,
+          round(
+            (s.share_count * s.close / NULLIF(t.total_value, 0) * 100)::numeric, 2
+          ) AS weight_pct,
+          s.trade_date AS as_of
+        FROM snap s, total t
+        ORDER BY s.share_count * coalesce(s.close, 0) DESC NULLS LAST
+        """
+    )
+    rows = [_row_to_dict(r) for r in conn.execute(sql, {"etf": etf})]
+    return {
+        "etf": _etf_label(conn, etf),
+        "n_holdings": len(rows),
+        "as_of": rows[0]["as_of"] if rows else None,
+        "holdings": rows,
+    }
 
 
 def get_stock_history(
