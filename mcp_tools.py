@@ -135,37 +135,26 @@ def get_etf_buy_delta(
 
 
 def get_etf_holdings(conn: Connection, etf: str) -> dict:
-    """Latest holdings snapshot for one ETF (all stocks, with weight + value)."""
+    """Latest holdings snapshot — uses CMoney's official weight_pct from shares."""
     sql = text(
         f"""
         WITH latest AS (
           SELECT max(trade_date) AS d FROM shares WHERE etf_code = :etf
-        ),
-        snap AS (
-          SELECT s.stock_code, s.stock_name, s.share_count, s.trade_date,
-                 p.close
-          FROM shares s
-          LEFT JOIN prices p USING (stock_code, trade_date)
-          WHERE s.etf_code = :etf
-            AND s.trade_date = (SELECT d FROM latest)
-            AND {_EXCLUDE_NON_STOCK.replace('stock_code', 's.stock_code')}
-        ),
-        total AS (
-          SELECT sum(share_count * close) AS total_value FROM snap
-          WHERE close IS NOT NULL
         )
         SELECT
           s.stock_code,
           s.stock_name,
           s.share_count::bigint AS shares,
-          s.close,
-          round((s.share_count * s.close / 1e8)::numeric, 4) AS value_yi,
-          round(
-            (s.share_count * s.close / NULLIF(t.total_value, 0) * 100)::numeric, 2
-          ) AS weight_pct,
+          p.close,
+          round((s.share_count * p.close / 1e8)::numeric, 4) AS value_yi,
+          s.weight_pct,
           s.trade_date AS as_of
-        FROM snap s, total t
-        ORDER BY s.share_count * coalesce(s.close, 0) DESC NULLS LAST
+        FROM shares s
+        LEFT JOIN prices p USING (stock_code, trade_date)
+        WHERE s.etf_code = :etf
+          AND s.trade_date = (SELECT d FROM latest)
+          AND {_EXCLUDE_NON_STOCK.replace('stock_code', 's.stock_code')}
+        ORDER BY s.weight_pct DESC NULLS LAST
         """
     )
     rows = [_row_to_dict(r) for r in conn.execute(sql, {"etf": etf})]
