@@ -47,7 +47,7 @@ def list_etfs(conn: Connection) -> list[dict]:
         )
         SELECT
           e.code,
-          m.stock_name AS name,
+          coalesce(m.stock_name, e.name) AS name,
           m.aum_billion_twd,
           m.etf_type,
           m.dividend_policy
@@ -61,14 +61,19 @@ def list_etfs(conn: Connection) -> list[dict]:
 
 
 def _etf_label(conn: Connection, etf: str) -> dict:
-    """Resolve ETF code → {code, name} from latest meta snapshot."""
+    """Resolve ETF code → {code, name}.
+
+    Prefer meta.stock_name (richer / official) but fall back to etf.name
+    when the ETF is too new to have a meta snapshot yet.
+    """
     sql = text(
         """
-        SELECT m.stock_name AS name
-        FROM meta m
-        WHERE m.etf_code = :etf
-        ORDER BY m.snapshot_year DESC
-        LIMIT 1
+        SELECT coalesce(
+          (SELECT m.stock_name FROM meta m
+           WHERE m.etf_code = :etf
+           ORDER BY m.snapshot_year DESC LIMIT 1),
+          (SELECT e.name FROM etf e WHERE e.code = :etf)
+        ) AS name
         """
     )
     row = conn.execute(sql, {"etf": etf}).first()
