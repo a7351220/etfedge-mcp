@@ -1,0 +1,13 @@
+[project]
+name = "etfedge-mcp"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "fastmcp>=2.0",
+    "uvicorn[standard]>=0.30",
+    "sqlalchemy>=2.0",
+    "psycopg[binary]>=3.2",
+]
+
+[project.scripts]
+etfedge-mcp = "mcp_server:main"
