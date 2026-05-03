@@ -58,7 +58,7 @@ engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_size=4, max_overfl
 
 # Cap every query at 10 s — reduced from 30 s. Enough for all named tools
 # (get_consensus_buys CTE runs ~1-3 s on this dataset) while cutting off
-# pathological cartesian joins in query_sql 3× faster than before.
+# pathological queries 3× faster than before.
 @event.listens_for(engine, "connect")
 def _set_statement_timeout(dbapi_conn, _record):
     cur = dbapi_conn.cursor()
@@ -536,7 +536,7 @@ def get_stock_pnl(etf: str, stock_code: str) -> dict:
 
     NOTE: this is current valuation, NOT realized P&L. Real cost-basis
     P&L needs the cumulative buy series — use get_stock_history then
-    compute outside, or run query_sql with a CTE.
+    compute outside.
     """
     with engine.connect() as conn:
         return mcp_tools.get_stock_pnl(conn, etf, stock_code)
@@ -566,34 +566,6 @@ def get_consensus_buys(
         return mcp_tools.get_consensus_buys(
             conn, start_date, end_date, min_etfs
         )
-
-
-@mcp.tool()
-def query_sql(sql: str) -> dict:
-    """Run an arbitrary SELECT against the read-only PG warehouse.
-
-    Escape hatch for queries the 5 named recipes don't cover.
-
-    Four safety layers:
-    1. PG user is `claude_mcp_ro` (only SELECT granted at DB level).
-    2. SQL length capped at 5000 characters.
-    3. Server rejects regex match of write keywords before sending.
-    4. Result truncated to first 1000 rows; truncation flag returned.
-
-    Args:
-        sql: a SELECT statement. Write keywords (INSERT/UPDATE/DELETE/
-            DROP/TRUNCATE/ALTER/CREATE/GRANT/REVOKE/COPY/VACUUM) are
-            rejected before execution.
-
-    Returns:
-        {"rows": [...], "truncated": bool, "row_count": int}
-        On error: {"error": "<message>", "rows": [], "truncated": false}
-
-    Tip: the 8-table schema is documented in tw-active's
-    `.claude/skills/stock_analyst/SKILL.md`.
-    """
-    with engine.connect() as conn:
-        return mcp_tools.query_sql(conn, sql)
 
 
 # ── Entry ───────────────────────────────────────────────────────────
