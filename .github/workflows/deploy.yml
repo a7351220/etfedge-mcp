@@ -1,0 +1,25 @@
+name: Deploy to Zeabur
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Deploy to Zeabur
+        env:
+          ZEABUR_TOKEN: ${{ secrets.ZEABUR_TOKEN }}
+        run: |
+          npx zeabur@latest auth login --token "$ZEABUR_TOKEN" -i=false
+          npx zeabur@latest deploy \
+            --project-id 69ef1de69d832fcd98bfa9d2 \
+            --service-id ${{ secrets.MCP_SERVICE_ID }} \
+            -i=false
