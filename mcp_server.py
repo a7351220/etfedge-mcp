@@ -642,7 +642,7 @@ def get_stock_history(
 
 @mcp.tool()
 def get_stock_pnl(etf: str, stock_code: str) -> dict:
-    """Current market value of an ETF's holding of a single stock.
+    """Legacy valuation tool: current market value, not actual P&L.
 
     Args:
         etf: ETF code, e.g. "00981A".
@@ -651,14 +651,30 @@ def get_stock_pnl(etf: str, stock_code: str) -> dict:
     Returns:
         {"share_count": <latest>, "close": <latest>,
          "market_value_yi": share_count * close / 1e8 (億 NTD),
-         "close_as_of": YYYY-MM-DD, "shares_as_of": YYYY-MM-DD}
+         "close_as_of": YYYY-MM-DD, "shares_as_of": YYYY-MM-DD,
+         "is_pnl": false}
 
-    NOTE: this is current valuation, NOT realized P&L. Real cost-basis
-    P&L needs the cumulative buy series — use get_stock_history then
-    compute outside.
+    Use get_stock_unrealized_pnl_estimate when the user asks "賺多少".
     """
     with engine.connect() as conn:
         return mcp_tools.get_stock_pnl(conn, etf, stock_code)
+
+
+@mcp.tool()
+def get_stock_unrealized_pnl_estimate(etf: str, stock_code: str) -> dict:
+    """Estimate an ETF's unrealized P&L for one stock holding.
+
+    Args:
+        etf: ETF code, e.g. "00981A".
+        stock_code: stock code, e.g. "2327".
+
+    Returns estimated current shares, latest close, estimated remaining cost,
+    market value, unrealized P&L, and return %. This is an estimate only:
+    it derives buys/sells from daily share-count deltas and market closes,
+    not real broker lots, fees, taxes, dividends, or issuer trade prices.
+    """
+    with engine.connect() as conn:
+        return mcp_tools.get_stock_unrealized_pnl_estimate(conn, etf, stock_code)
 
 
 @mcp.tool()

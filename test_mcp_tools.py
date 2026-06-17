@@ -1,4 +1,6 @@
 import mcp_tools
+from datetime import date
+from decimal import Decimal
 
 
 class _Conn:
@@ -56,6 +58,37 @@ def test_query_table_uses_safe_sql_parts():
     assert conn.params == {"v0": "00981A", "limit": 500, "offset": 0}
 
 
+def test_unrealized_pnl_estimate_weighted_average():
+    result = mcp_tools._estimate_unrealized_pnl(
+        [
+            {
+                "trade_date": date(2026, 1, 1),
+                "share_count": 100_000_000,
+                "close": Decimal("10"),
+            },
+            {
+                "trade_date": date(2026, 1, 2),
+                "share_count": 150_000_000,
+                "close": Decimal("20"),
+            },
+            {
+                "trade_date": date(2026, 1, 3),
+                "share_count": 120_000_000,
+                "close": Decimal("30"),
+            },
+        ],
+        Decimal("40"),
+        date(2026, 1, 4),
+    )
+    assert result["current_shares"] == 120_000_000
+    assert result["estimated_cost_yi"] == 16.0
+    assert result["market_value_yi"] == 48.0
+    assert result["unrealized_pnl_yi"] == 32.0
+    assert result["unrealized_return_pct"] == 200.0
+    assert result["estimate_complete"] is True
+
+
 if __name__ == "__main__":
     test_table_safety_helpers()
     test_query_table_uses_safe_sql_parts()
+    test_unrealized_pnl_estimate_weighted_average()

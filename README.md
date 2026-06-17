@@ -91,7 +91,8 @@ Config 路徑：
 | `get_etf_buy_delta` | 取得某 ETF 今日加減碼股票（張數變化 + 市值） |
 | `get_etf_holdings` | 取得某 ETF 最新完整持股明細 |
 | `get_stock_history` | 取得某 ETF 某股票的歷史持股張數 |
-| `get_stock_pnl` | 取得某 ETF 某股票的目前市值估算 |
+| `get_stock_pnl` | Legacy：取得某 ETF 某股票的目前市值，不是真實損益 |
+| `get_stock_unrealized_pnl_estimate` | 用每日股數變化與收盤價估算某 ETF 某股票的未實現損益 |
 | `get_consensus_buys` | 跨 ETF 共識加碼股票（≥N 家 ETF 同時加碼） |
 
 `query_table` 不提供 raw SQL。`prices` 必須帶 `stock_code` 或 `trade_date`

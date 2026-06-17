@@ -9,6 +9,7 @@ without needing fastmcp / FastAPI / SSE in the test harness.
 from __future__ import annotations
 
 from datetime import date, datetime
+from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import text
@@ -518,9 +519,126 @@ def get_stock_pnl(conn: Connection, etf: str, stock_code: str) -> dict:
             "market_value_yi": 0,
             "close_as_of": None,
             "shares_as_of": None,
+            "is_pnl": False,
             "note": "no data found for this etf+stock pair",
         }
-    return _row_to_dict(row)
+    result = _row_to_dict(row)
+    result["is_pnl"] = False
+    result["note"] = (
+        "legacy valuation tool: returns current market value only. "
+        "Use get_stock_unrealized_pnl_estimate for estimated P&L."
+    )
+    return result
+
+
+# ponytail: weighted-average estimate from daily close; replace with broker lots if real cost basis lands.
+def _estimate_unrealized_pnl(
+    rows: list[dict], latest_close: Decimal, latest_close_date: date
+) -> dict:
+    shares = Decimal(0)
+    cost = Decimal(0)
+    bought = Decimal(0)
+    sold = Decimal(0)
+    missing_price_dates: list[str] = []
+
+    for row in rows:
+        next_shares = Decimal(row["share_count"] or 0)
+        delta = next_shares - shares
+        close = row.get("close")
+        if close is None:
+            if delta > 0:
+                missing_price_dates.append(row["trade_date"].isoformat())
+            shares = next_shares
+            continue
+
+        close = Decimal(close)
+        if delta > 0:
+            bought += delta
+            cost += delta * close
+        elif delta < 0 and shares > 0:
+            sell_qty = min(-delta, shares)
+            sold += sell_qty
+            cost -= cost * (sell_qty / shares)
+        shares = next_shares
+        if shares <= 0:
+            shares = Decimal(0)
+            cost = Decimal(0)
+
+    market_value = shares * latest_close
+    unrealized = market_value - cost
+    return {
+        "current_shares": int(shares),
+        "latest_close": float(latest_close),
+        "latest_close_date": latest_close_date.isoformat(),
+        "estimated_cost_yi": round(float(cost / Decimal("1e8")), 2),
+        "market_value_yi": round(float(market_value / Decimal("1e8")), 2),
+        "unrealized_pnl_yi": round(float(unrealized / Decimal("1e8")), 2),
+        "unrealized_return_pct": (
+            round(float(unrealized / cost * 100), 2) if cost else None
+        ),
+        "total_bought_shares": int(bought),
+        "total_sold_shares": int(sold),
+        "missing_price_dates": missing_price_dates[:20],
+        "estimate_complete": not missing_price_dates,
+        "method": "weighted_average_cost_from_daily_share_delta_and_close",
+    }
+
+
+def get_stock_unrealized_pnl_estimate(
+    conn: Connection, etf: str, stock_code: str
+) -> dict:
+    series_sql = text(
+        """
+        SELECT
+          s.trade_date,
+          s.stock_name,
+          s.share_count::numeric AS share_count,
+          px.close
+        FROM shares s
+        LEFT JOIN LATERAL (
+          SELECT p.close
+          FROM prices p
+          WHERE p.stock_code = s.stock_code AND p.trade_date <= s.trade_date
+          ORDER BY p.trade_date DESC
+          LIMIT 1
+        ) px ON true
+        WHERE s.etf_code = :etf AND s.stock_code = :stock_code
+        ORDER BY s.trade_date ASC
+        """
+    )
+    close_sql = text(
+        """
+        SELECT close, trade_date
+        FROM prices
+        WHERE stock_code = :stock_code
+        ORDER BY trade_date DESC
+        LIMIT 1
+        """
+    )
+    params = {"etf": etf, "stock_code": stock_code}
+    rows = [dict(r._mapping) for r in conn.execute(series_sql, params)]
+    latest = conn.execute(close_sql, {"stock_code": stock_code}).first()
+    if not rows or latest is None:
+        return {
+            "etf": _etf_label(conn, etf),
+            "stock_code": stock_code,
+            "stock_name": rows[-1]["stock_name"] if rows else None,
+            "note": "no data found for this etf+stock pair",
+        }
+
+    result = _estimate_unrealized_pnl(rows, latest.close, latest.trade_date)
+    result.update({
+        "etf": _etf_label(conn, etf),
+        "stock_code": stock_code,
+        "stock_name": rows[-1]["stock_name"],
+        "shares_as_of": rows[-1]["trade_date"].isoformat(),
+        "first_seen": rows[0]["trade_date"].isoformat(),
+        "note": (
+            "Estimate only: uses daily share-count deltas and market closes, "
+            "not broker lots, fees, taxes, dividends, or issuer trade prices."
+        ),
+    })
+    return result
 
 
 def get_consensus_buys(
@@ -598,4 +716,3 @@ def get_consensus_buys(
             },
         )
     ]
-
