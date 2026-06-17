@@ -1,4 +1,4 @@
-"""SQL query implementations for the 6 MCP tools.
+"""SQL query implementations for the MCP tools.
 
 Each function takes a SQLAlchemy Connection and returns plain
 list[dict] / dict — JSON-serialisable for MCP transport.
@@ -8,7 +8,7 @@ without needing fastmcp / FastAPI / SSE in the test harness.
 """
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from typing import Any
 
 from sqlalchemy import text
@@ -25,18 +25,300 @@ _EXCLUDE_NON_STOCK = (
     "AND stock_code !~ '^[0-9]{6}F'"
 )
 
+_MAX_LIMIT = 500
+_OPS = {
+    "eq": "=",
+    "ne": "!=",
+    "lt": "<",
+    "lte": "<=",
+    "gt": ">",
+    "gte": ">=",
+    "like": "LIKE",
+    "ilike": "ILIKE",
+}
+
+_DB_TABLES: dict[str, dict[str, Any]] = {
+    "etf": {
+        "description": "ETF master records.",
+        "columns": ["code", "name", "issuer"],
+        "date_columns": [],
+    },
+    "meta": {
+        "description": "ETF yearly metadata, AUM, type, fees, listing date.",
+        "columns": [
+            "etf_code", "snapshot_year", "stock_name", "tracked_index",
+            "tracking_method", "etf_type", "leverage_inverse",
+            "aum_billion_twd", "asset_class", "units_outstanding_thousand",
+            "issuer", "listing_date", "management_fee_text",
+            "custody_fee_text", "total_fee_text", "dividend_policy",
+            "currency",
+        ],
+        "date_columns": ["listing_date"],
+    },
+    "holdings": {
+        "description": "ETF holdings weights by date.",
+        "columns": ["etf_code", "trade_date", "stock_code", "stock_name", "weight_pct"],
+        "date_columns": ["trade_date"],
+    },
+    "shares": {
+        "description": "ETF holdings shares by date.",
+        "columns": [
+            "etf_code", "trade_date", "stock_code", "stock_name",
+            "weight_pct", "share_count", "unit",
+        ],
+        "date_columns": ["trade_date"],
+    },
+    "premium": {
+        "description": "ETF close, NAV, and premium/discount by date.",
+        "columns": ["etf_code", "trade_date", "close_price", "nav", "premium_pct"],
+        "date_columns": ["trade_date"],
+    },
+    "dividend": {
+        "description": "ETF dividend records.",
+        "columns": [
+            "etf_code", "year_quarter", "cash_dividend_twd",
+            "dividend_yield_pct", "ex_date", "pay_date",
+        ],
+        "date_columns": ["ex_date", "pay_date"],
+    },
+    "prices": {
+        "description": "TWSE/TPEx daily OHLCV by stock_code. Requires filters.",
+        "columns": [
+            "stock_code", "trade_date", "open", "high", "low", "close",
+            "volume_shares", "volume_ntd", "transactions", "adj_factor",
+        ],
+        "date_columns": ["trade_date"],
+        "requires_filter": True,
+        "required_filter_columns": {"stock_code", "trade_date"},
+    },
+    "price_adjustments": {
+        "description": "Raw price adjustment events.",
+        "columns": ["stock_code", "event_date", "event_type", "ratio"],
+        "date_columns": ["event_date"],
+    },
+    "company_shares": {
+        "description": "Company issued shares snapshots.",
+        "columns": [
+            "stock_code", "snapshot_date", "market", "company_name",
+            "issue_shares", "paid_in_capital_twd", "source_url", "fetched_at",
+        ],
+        "date_columns": ["snapshot_date", "fetched_at"],
+    },
+    "company_industry_chains": {
+        "description": "Official company industry chain taxonomy.",
+        "columns": [
+            "stock_code", "snapshot_date", "ic_code", "chain_code",
+            "subchain_code", "company_name", "ic_name", "chain_name",
+            "subchain_name", "market_bucket", "source_url", "fetched_at",
+        ],
+        "date_columns": ["snapshot_date", "fetched_at"],
+    },
+    "company_industry_blocks": {
+        "description": "ETFedge normalized company industry blocks.",
+        "columns": [
+            "stock_code", "snapshot_date", "company_name", "block_code",
+            "block_name", "rule_version", "rule_priority", "source_ic_code",
+            "source_ic_name", "source_chain_code", "source_chain_name",
+            "source_subchain_code", "source_subchain_name", "source_url",
+            "fetched_at",
+        ],
+        "date_columns": ["snapshot_date", "fetched_at"],
+    },
+    "job_runs": {
+        "description": "Cron/update job status telemetry.",
+        "columns": [
+            "id", "job_name", "status", "started_at", "updated_at",
+            "finished_at", "upstream_date", "deployment_id", "hostname",
+            "pid", "detail", "events", "error",
+        ],
+        "date_columns": ["started_at", "updated_at", "finished_at"],
+    },
+}
+
 
 def _row_to_dict(row: Any) -> dict:
-    """SQLAlchemy Row → plain dict (handles Decimal/date → str)."""
+    """SQLAlchemy Row -> plain dict (handles Decimal/date -> str)."""
     out = {}
     for k, v in row._mapping.items():
-        if isinstance(v, (date,)):
+        if isinstance(v, (date, datetime)):
             out[k] = v.isoformat()
         elif hasattr(v, "is_finite"):  # Decimal
             out[k] = float(v)
         else:
             out[k] = v
     return out
+
+
+def _table(name: str) -> dict[str, Any]:
+    try:
+        return _DB_TABLES[name]
+    except KeyError as exc:
+        raise ValueError(f"table is not allowed: {name}") from exc
+
+
+def _column(table: str, column: str) -> str:
+    if column not in _table(table)["columns"]:
+        raise ValueError(f"column is not allowed for {table}: {column}")
+    return column
+
+
+def _limit(value: int) -> int:
+    return max(1, min(int(value or 100), _MAX_LIMIT))
+
+
+def _where(table: str, filters: list[dict] | None) -> tuple[str, dict[str, Any]]:
+    spec = _table(table)
+    filters = filters or []
+    if spec.get("requires_filter"):
+        required = spec.get("required_filter_columns", set())
+        seen = {f.get("column") for f in filters if isinstance(f, dict)}
+        if not filters or not (seen & required):
+            raise ValueError(
+                f"{table} requires at least one filter on: {', '.join(sorted(required))}"
+            )
+
+    parts: list[str] = []
+    params: dict[str, Any] = {}
+    for i, f in enumerate(filters):
+        if not isinstance(f, dict):
+            raise ValueError("filters must be objects")
+        col = _column(table, str(f.get("column", "")))
+        op = str(f.get("op", "eq")).lower()
+        key = f"v{i}"
+        if op == "in":
+            value = f.get("value") or []
+            if not isinstance(value, list) or not value:
+                raise ValueError("in filter requires a non-empty list value")
+            if len(value) > _MAX_LIMIT:
+                raise ValueError(f"in filter accepts at most {_MAX_LIMIT} values")
+            parts.append(f"{col} = ANY(:{key})")
+            params[key] = value
+        elif op in _OPS:
+            parts.append(f"{col} {_OPS[op]} :{key}")
+            params[key] = f.get("value")
+        else:
+            raise ValueError(f"unsupported filter op: {op}")
+
+    return ("WHERE " + " AND ".join(parts) if parts else ""), params
+
+
+def list_db_tables(conn: Connection) -> list[dict]:
+    existing = {
+        r[0]
+        for r in conn.execute(text(
+            """
+            SELECT table_name
+            FROM information_schema.tables
+            WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
+            """
+        ))
+    }
+    return [
+        {
+            "table": name,
+            "description": spec["description"],
+            "columns": len(spec["columns"]),
+            "requires_filter": bool(spec.get("requires_filter")),
+        }
+        for name, spec in _DB_TABLES.items()
+        if name in existing
+    ]
+
+
+def describe_table(conn: Connection, table: str) -> dict:
+    spec = _table(table)
+    rows = conn.execute(
+        text(
+            """
+            SELECT column_name, data_type, is_nullable
+            FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = :table
+            ORDER BY ordinal_position
+            """
+        ),
+        {"table": table},
+    )
+    columns = [_row_to_dict(r) for r in rows if r.column_name in spec["columns"]]
+    return {
+        "table": table,
+        "description": spec["description"],
+        "requires_filter": bool(spec.get("requires_filter")),
+        "allowed_columns": spec["columns"],
+        "columns": columns,
+    }
+
+
+def get_table_stats(conn: Connection, table: str) -> dict:
+    spec = _table(table)
+    selects = ["count(*)::bigint AS row_count"]
+    for col in spec["date_columns"]:
+        selects.append(f"min({col}) AS min_{col}")
+        selects.append(f"max({col}) AS max_{col}")
+    row = conn.execute(text(f"SELECT {', '.join(selects)} FROM {table}")).first()
+    return {"table": table, **(_row_to_dict(row) if row else {})}
+
+
+def query_table(
+    conn: Connection,
+    table: str,
+    filters: list[dict] | None = None,
+    sort_by: str | None = None,
+    sort_dir: str = "asc",
+    limit: int = 100,
+    offset: int = 0,
+) -> list[dict]:
+    spec = _table(table)
+    where, params = _where(table, filters)
+    order = ""
+    if sort_by:
+        sort_col = _column(table, sort_by)
+        direction = "DESC" if str(sort_dir).lower() == "desc" else "ASC"
+        order = f"ORDER BY {sort_col} {direction}"
+    cols = ", ".join(spec["columns"])
+    params.update({"limit": _limit(limit), "offset": max(0, int(offset or 0))})
+    sql = text(f"SELECT {cols} FROM {table} {where} {order} LIMIT :limit OFFSET :offset")
+    return [_row_to_dict(r) for r in conn.execute(sql, params)]
+
+
+def get_distinct_values(
+    conn: Connection,
+    table: str,
+    column: str,
+    filters: list[dict] | None = None,
+    limit: int = 100,
+) -> list[dict]:
+    col = _column(table, column)
+    where, params = _where(table, filters)
+    params["limit"] = _limit(limit)
+    sql = text(
+        f"""
+        SELECT {col} AS value, count(*)::bigint AS row_count
+        FROM {table}
+        {where}
+        GROUP BY {col}
+        ORDER BY row_count DESC NULLS LAST, {col}
+        LIMIT :limit
+        """
+    )
+    return [_row_to_dict(r) for r in conn.execute(sql, params)]
+
+
+def get_data_freshness(conn: Connection) -> list[dict]:
+    rows: list[dict] = []
+    for table, spec in _DB_TABLES.items():
+        date_cols = spec["date_columns"]
+        if not date_cols:
+            continue
+        col = date_cols[0]
+        try:
+            row = conn.execute(
+                text(f"SELECT max({col}) AS latest, count(*)::bigint AS row_count FROM {table}")
+            ).first()
+        except Exception:
+            continue
+        item = _row_to_dict(row)
+        rows.append({"table": table, "freshness_column": col, **item})
+    return rows
 
 
 def list_etfs(conn: Connection) -> list[dict]:
@@ -316,5 +598,4 @@ def get_consensus_buys(
             },
         )
     ]
-
 

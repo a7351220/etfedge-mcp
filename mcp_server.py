@@ -1,4 +1,4 @@
-"""MCP server exposing 6 read-only PG query tools.
+"""MCP server exposing read-only PG query tools.
 
 Runs as a third background process inside the stock-cron container
 (alongside nginx + cron daemon). Listens on 127.0.0.1:8000 — public
@@ -461,6 +461,85 @@ class _MCPMiddleware:
 
 
 # ── Tools ───────────────────────────────────────────────────────────
+@mcp.tool()
+def list_db_tables() -> list[dict]:
+    """List public database tables exposed through the safe allowlist.
+
+    This intentionally does not expose arbitrary public tables such as
+    admin/session tables. Use describe_table before query_table.
+    """
+    with engine.connect() as conn:
+        return mcp_tools.list_db_tables(conn)
+
+
+@mcp.tool()
+def describe_table(table: str) -> dict:
+    """Describe one allowlisted table and its allowed columns.
+
+    Args:
+        table: allowlisted table name from list_db_tables.
+    """
+    with engine.connect() as conn:
+        return mcp_tools.describe_table(conn, table)
+
+
+@mcp.tool()
+def get_table_stats(table: str) -> dict:
+    """Return row count and min/max date columns for one allowlisted table."""
+    with engine.connect() as conn:
+        return mcp_tools.get_table_stats(conn, table)
+
+
+@mcp.tool()
+def query_table(
+    table: str,
+    filters: list[dict] | None = None,
+    sort_by: str | None = None,
+    sort_dir: str = "asc",
+    limit: int = 100,
+    offset: int = 0,
+) -> list[dict]:
+    """Query rows from one allowlisted table with safe filters and pagination.
+
+    Args:
+        table: allowlisted table name.
+        filters: optional list like
+            [{"column": "etf_code", "op": "eq", "value": "00981A"}].
+            Supported ops: eq, ne, lt, lte, gt, gte, like, ilike, in.
+            `prices` requires a filter on stock_code or trade_date.
+        sort_by: optional allowed column.
+        sort_dir: "asc" or "desc".
+        limit: max 500.
+        offset: pagination offset.
+    """
+    with engine.connect() as conn:
+        return mcp_tools.query_table(
+            conn, table, filters, sort_by, sort_dir, limit, offset
+        )
+
+
+@mcp.tool()
+def get_distinct_values(
+    table: str,
+    column: str,
+    filters: list[dict] | None = None,
+    limit: int = 100,
+) -> list[dict]:
+    """Return distinct values and counts for one allowlisted table column.
+
+    `prices` requires a stock_code or trade_date filter here too.
+    """
+    with engine.connect() as conn:
+        return mcp_tools.get_distinct_values(conn, table, column, filters, limit)
+
+
+@mcp.tool()
+def get_data_freshness() -> list[dict]:
+    """Return latest available dates/counts for allowlisted data tables."""
+    with engine.connect() as conn:
+        return mcp_tools.get_data_freshness(conn)
+
+
 @mcp.tool()
 def list_etfs() -> list[dict]:
     """List all 21 active Taiwan ETFs in the warehouse.

@@ -81,12 +81,21 @@ Config 路徑：
 
 | Tool | Description |
 |------|-------------|
+| `list_db_tables` | 列出可瀏覽的安全 allowlist 資料表 |
+| `describe_table` | 查看 allowlist table 欄位與限制 |
+| `get_table_stats` | 查看資料表 row count 與日期範圍 |
+| `query_table` | 用參數化 filter/sort/pagination 查詢 allowlist table（limit max 500） |
+| `get_distinct_values` | 查詢某欄位 distinct values 與筆數 |
+| `get_data_freshness` | 查看各資料集最新日期與筆數 |
 | `list_etfs` | 列出所有主動 ETF（代號、名稱、AUM、最新持股數） |
 | `get_etf_buy_delta` | 取得某 ETF 今日加減碼股票（張數變化 + 市值） |
 | `get_etf_holdings` | 取得某 ETF 最新完整持股明細 |
 | `get_stock_history` | 取得某 ETF 某股票的歷史持股張數 |
 | `get_stock_pnl` | 取得某 ETF 某股票的目前市值估算 |
 | `get_consensus_buys` | 跨 ETF 共識加碼股票（≥N 家 ETF 同時加碼） |
+
+`query_table` 不提供 raw SQL。`prices` 必須帶 `stock_code` 或 `trade_date`
+filter，所有 table 查詢都限制在 allowlist 欄位且 `limit` 最高 500。
 
 ## Auth
 
