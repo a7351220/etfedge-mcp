@@ -610,7 +610,7 @@ def get_stock_unrealized_pnl_estimate(
         """
         SELECT close, trade_date
         FROM prices
-        WHERE stock_code = :stock_code
+        WHERE stock_code = :stock_code AND close IS NOT NULL
         ORDER BY trade_date DESC
         LIMIT 1
         """
